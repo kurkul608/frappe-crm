@@ -79,15 +79,9 @@ services:
         wait-for-it -t 120 redis-cache:6379;
         wait-for-it -t 120 redis-queue:6379;
         if [ -d "sites/$$SITE_NAME" ]; then
-          echo "Site $$SITE_NAME already exists, skipping creation";
+        echo "Site $$SITE_NAME already exists, skipping creation";
         else
-          bench new-site "$$SITE_NAME"
-          --mariadb-user-host-login-scope='%'
-          --admin-password="$$ADMIN_PASSWORD"
-          --db-root-username=root
-          --db-root-password="$$DB_PASSWORD"
-          --install-app crm
-          --set-default;
+        bench new-site "$$SITE_NAME" --mariadb-user-host-login-scope='%' --admin-password="$$ADMIN_PASSWORD" --db-root-username=root --db-root-password="$$DB_PASSWORD" --install-app crm --set-default;
         fi;
     environment:
       SITE_NAME: ${CRM_SITE_NAME:?задай CRM_SITE_NAME (домен) в окружении Komodo}
