@@ -1,0 +1,182 @@
+# Продакшен-деплой этого форка Frappe CRM через Komodo (или любой
+# docker compose) за Traefik.
+#
+# Образ собирается на хосте из канонического Containerfile репозитория
+# frappe_docker (контекст сборки — их git-репа, запинена на коммит).
+# Само приложение crm ставится из этого репозитория — см. apps.json рядом.
+#
+# ВАЖНО: в контейнер попадает код, запушенный в GitHub (ветка из
+# apps.json), а не локальный checkout. Перед деплоем — git push.
+#
+# Никаких секретов и площадко-специфичных значений в файле нет — всё
+# берётся из окружения (задать в Komodo):
+#   CRM_DB_ROOT_PASSWORD — root-пароль MariaDB
+#   CRM_ADMIN_PASSWORD   — пароль Administrator первого сайта
+#   CRM_SITE_NAME        — домен, он же имя сайта Frappe
+# Опциональные — см. .env.example.
+
+name: frappe-crm
+
+x-app: &app
+  image: frappe-crm:${CRM_IMAGE_TAG:-latest}
+  restart: unless-stopped
+  volumes:
+    - sites:/home/frappe/frappe-bench/sites
+    - logs:/home/frappe/frappe-bench/logs
+
+x-depends-configurator: &depends_configurator
+  depends_on:
+    configurator:
+      condition: service_completed_successfully
+
+services:
+  backend:
+    <<: [*app, *depends_configurator]
+    build:
+      context: https://github.com/frappe/frappe_docker.git#380b9d069ab949754fe78331af647b673984dc04
+      dockerfile: images/custom/Containerfile
+      args:
+        # frappe~=15.0.0 в pyproject.toml форка -> version-15 + совместимые рантаймы
+        FRAPPE_BRANCH: ${FRAPPE_BRANCH:-version-15}
+        PYTHON_VERSION: ${PYTHON_VERSION:-3.11.9}
+        NODE_VERSION: ${NODE_VERSION:-20}
+        # Слои bench init кешируются; поднять значение, чтобы форсировать
+        # пересборку с новым кодом форка.
+        CACHE_BUST: ${CRM_CACHE_BUST:-1}
+      secrets:
+        - apps_json
+
+  configurator:
+    <<: *app
+    restart: "no"
+    entrypoint: ["bash", "-c"]
+    command:
+      - >
+        ls -1 apps > sites/apps.txt;
+        bench set-config -g db_host $$DB_HOST;
+        bench set-config -gp db_port $$DB_PORT;
+        bench set-config -g redis_cache "redis://$$REDIS_CACHE";
+        bench set-config -g redis_queue "redis://$$REDIS_QUEUE";
+        bench set-config -g redis_socketio "redis://$$REDIS_QUEUE";
+        bench set-config -gp socketio_port $$SOCKETIO_PORT;
+    environment:
+      DB_HOST: db
+      DB_PORT: "3306"
+      REDIS_CACHE: redis-cache:6379
+      REDIS_QUEUE: redis-queue:6379
+      SOCKETIO_PORT: "9000"
+    depends_on:
+      db:
+        condition: service_healthy
+
+  create-site:
+    <<: [*app, *depends_configurator]
+    restart: "no"
+    entrypoint: ["bash", "-c"]
+    command:
+      - >
+        wait-for-it -t 120 db:3306;
+        wait-for-it -t 120 redis-cache:6379;
+        wait-for-it -t 120 redis-queue:6379;
+        if [ -d "sites/$$SITE_NAME" ]; then
+          echo "Site $$SITE_NAME already exists, skipping creation";
+        else
+          bench new-site "$$SITE_NAME"
+          --mariadb-user-host-login-scope='%'
+          --admin-password="$$ADMIN_PASSWORD"
+          --db-root-username=root
+          --db-root-password="$$DB_PASSWORD"
+          --install-app crm
+          --set-default;
+        fi;
+    environment:
+      SITE_NAME: ${CRM_SITE_NAME:?задай CRM_SITE_NAME (домен) в окружении Komodo}
+      ADMIN_PASSWORD: ${CRM_ADMIN_PASSWORD:?задай CRM_ADMIN_PASSWORD в окружении Komodo}
+      DB_PASSWORD: ${CRM_DB_ROOT_PASSWORD:?задай CRM_DB_ROOT_PASSWORD в окружении Komodo}
+
+  db:
+    image: mariadb:10.11
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      start_period: 5s
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --skip-character-set-client-handshake
+    environment:
+      MARIADB_ROOT_PASSWORD: ${CRM_DB_ROOT_PASSWORD:?задай CRM_DB_ROOT_PASSWORD в окружении Komodo}
+    volumes:
+      - db-data:/var/lib/mysql
+
+  redis-cache:
+    image: redis:6.2-alpine
+    restart: unless-stopped
+
+  redis-queue:
+    image: redis:6.2-alpine
+    restart: unless-stopped
+    volumes:
+      - redis-queue-data:/data
+
+  websocket:
+    <<: [*app, *depends_configurator]
+    command: ["node", "/home/frappe/frappe-bench/apps/frappe/socketio.js"]
+
+  queue-short:
+    <<: [*app, *depends_configurator]
+    command: ["bench", "worker", "--queue", "short,default"]
+
+  queue-long:
+    <<: [*app, *depends_configurator]
+    command: ["bench", "worker", "--queue", "long,default,short"]
+
+  scheduler:
+    <<: [*app, *depends_configurator]
+    command: ["bench", "schedule"]
+
+  frontend:
+    <<: *app
+    command: ["nginx-entrypoint.sh"]
+    environment:
+      BACKEND: backend:8000
+      SOCKETIO: websocket:9000
+      FRAPPE_SITE_NAME_HEADER: ${CRM_SITE_NAME:?задай CRM_SITE_NAME (домен) в окружении Komodo}
+      UPSTREAM_REAL_IP_ADDRESS: 127.0.0.1
+      UPSTREAM_REAL_IP_HEADER: X-Forwarded-For
+      UPSTREAM_REAL_IP_RECURSIVE: "off"
+      PROXY_READ_TIMEOUT: 120
+      CLIENT_MAX_BODY_SIZE: 50m
+    depends_on:
+      - backend
+      - websocket
+    networks:
+      - default
+      - proxy
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=${TRAEFIK_NETWORK:-proxy}"
+      - "traefik.http.routers.frappe-crm.rule=Host(`${CRM_SITE_NAME:?задай CRM_SITE_NAME (домен) в окружении Komodo}`)"
+      - "traefik.http.routers.frappe-crm.entrypoints=${TRAEFIK_ENTRYPOINT:-websecure}"
+      - "traefik.http.routers.frappe-crm.tls.certresolver=${TRAEFIK_CERTRESOLVER:-letsencrypt}"
+      # nginx внутри контейнера слушает 8080
+      - "traefik.http.services.frappe-crm.loadbalancer.server.port=8080"
+
+secrets:
+  apps_json:
+    file: ./apps.json
+
+volumes:
+  sites:
+  logs:
+  db-data:
+  redis-queue-data:
+
+networks:
+  default:
+  proxy:
+    external: true
+    name: ${TRAEFIK_NETWORK:-proxy}
