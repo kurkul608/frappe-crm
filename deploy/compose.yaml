@@ -46,6 +46,21 @@ services:
       secrets:
         - apps_json
 
+  # Том sites создаётся один раз и дальше живёт своей жизнью: после
+  # пересборки образа в нём остаётся старый assets.json со старыми хэшами
+  # бандлов, а файлы с этими хэшами из нового образа уже исчезли — фронт
+  # получает 404 вместо CSS/JS. Этот one-shot на каждом деплое копирует
+  # свежие ассеты из образа в том (том смонтирован в /vol, а не поверх
+  # sites, чтобы видеть ассеты самого образа).
+  sync-assets:
+    image: frappe-crm:${CRM_IMAGE_TAG:-latest}
+    restart: "no"
+    entrypoint: ["bash", "-c"]
+    command:
+      - mkdir -p /vol/assets && cp -af /home/frappe/frappe-bench/sites/assets/. /vol/assets/
+    volumes:
+      - sites:/vol
+
   configurator:
     <<: *app
     restart: "no"
@@ -68,6 +83,8 @@ services:
     depends_on:
       db:
         condition: service_healthy
+      sync-assets:
+        condition: service_completed_successfully
 
   create-site:
     <<: [*app, *depends_configurator]
