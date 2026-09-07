@@ -1,5 +1,12 @@
 import frappe
 
+# Email Account doctype select options use these names since frappe renamed them
+service_name_map = {
+	"Yandex": "Yandex.Mail",
+	"Outlook": "Outlook.com",
+	"Yahoo": "Yahoo Mail",
+}
+
 
 @frappe.whitelist()
 def create_email_account(data: dict):
@@ -14,7 +21,7 @@ def create_email_account(data: dict):
 				"doctype": "Email Account",
 				"email_id": data.get("email_id"),
 				"email_account_name": data.get("email_account_name"),
-				"service": service,
+				"service": service_name_map.get(service, service),
 				"enable_incoming": data.get("enable_incoming"),
 				"enable_outgoing": data.get("enable_outgoing"),
 				"default_incoming": data.get("default_incoming"),
